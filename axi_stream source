@@ -1,0 +1,204 @@
+`timescale 1ns / 1ps
+
+module sync_fifo #(
+  parameter int DEPTH  = 8,
+  parameter int DWIDTH = 16
+)(
+  input  logic             clk,
+  input  logic             rstn,
+  input  logic             wr_en,
+  input  logic             rd_en,
+  input  logic [DWIDTH-1:0] din,
+  output logic [DWIDTH-1:0] dout,
+  output logic             empty,
+  output logic             full
+);
+
+  localparam int PTR_WIDTH = $clog2(DEPTH);
+
+  logic [DWIDTH-1:0] fifo [DEPTH];
+  logic [PTR_WIDTH:0] wptr, rptr;
+
+  always_ff @(posedge clk) begin
+    if (!rstn)
+      wptr <= '0;
+    else if (wr_en && !full) begin
+      fifo[wptr[PTR_WIDTH-1:0]] <= din;
+      wptr <= wptr + 1;
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (!rstn) begin
+      rptr <= '0;
+      dout <= '0;
+    end else if (rd_en && !empty) begin
+      dout <= fifo[rptr[PTR_WIDTH-1:0]];
+      rptr <= rptr + 1;
+    end
+  end
+
+  assign empty = (wptr == rptr);
+  assign full  = (wptr[PTR_WIDTH] != rptr[PTR_WIDTH]) &&
+                 (wptr[PTR_WIDTH-1:0] == rptr[PTR_WIDTH-1:0]);
+
+endmodule
+
+
+module axis_fifo_bridge #(
+  parameter int DWIDTH = 32,
+  parameter int DEPTH  = 8
+)(
+  input  logic             clk,
+  input  logic             rstn,
+  input  logic [DWIDTH-1:0] s_axis_tdata,
+  input  logic              s_axis_tvalid,
+  input  logic              s_axis_tlast,
+  input  logic [3:0]        s_axis_tkeep,
+  output logic              s_axis_tready,
+  output logic [DWIDTH-1:0] m_axis_tdata,
+  output logic              m_axis_tvalid,
+  output logic              m_axis_tlast,
+  output logic [3:0]        m_axis_tkeep,
+  input  logic              m_axis_tready
+);
+
+  logic [DWIDTH+4:0] din, dout;
+  logic wr_en, rd_en;
+  logic empty, full;
+
+  assign din  = {s_axis_tlast, s_axis_tkeep, s_axis_tdata};
+  assign {m_axis_tlast, m_axis_tkeep, m_axis_tdata} = dout;
+
+  assign wr_en = s_axis_tvalid && !full;
+  assign rd_en = m_axis_tready && !empty;
+
+  assign s_axis_tready = !full;
+  assign m_axis_tvalid = !empty;
+
+  sync_fifo #(
+    .DEPTH  (DEPTH),
+    .DWIDTH (DWIDTH + 5)
+  ) fifo_inst (
+    .clk   (clk),
+    .rstn  (rstn),
+    .wr_en (wr_en),
+    .rd_en (rd_en),
+    .din   (din),
+    .dout  (dout),
+    .empty (empty),
+    .full  (full)
+  );
+
+endmodule
+
+
+module axis_master(
+  input  logic        clk,
+  input  logic        rst,
+  input  logic [7:0]  in_data,
+  input  logic        in_data_valid,
+  input  logic        tready,
+  output logic        tvalid,
+  output logic [31:0] tdata,
+  output logic        tlast,
+  output logic [3:0]  tkeep
+);
+
+  typedef enum logic [1:0] {
+    IDLE,
+    COLLECT_BYTES,
+    SEND_PACKET
+  } state_t;
+
+  state_t state, next_state;
+  logic [31:0] data_buffer;
+  logic [1:0]  byte_count;
+  logic [31:0] tdata_reg;
+  logic        tlast_reg;
+  logic [3:0]  tkeep_reg;
+
+  always_comb begin
+    next_state = state;
+    tvalid     = 1'b0;
+    case (state)
+      IDLE: if (in_data_valid) next_state = COLLECT_BYTES;
+      COLLECT_BYTES: if (in_data_valid && byte_count == 2'd3) next_state = SEND_PACKET;
+      SEND_PACKET: begin
+        tvalid = 1'b1;
+        if (tvalid && tready) next_state = IDLE;
+      end
+    endcase
+  end
+
+  assign tdata = tdata_reg;
+  assign tlast = tlast_reg;
+  assign tkeep = tkeep_reg;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      state       <= IDLE;
+      byte_count  <= '0;
+      data_buffer <= '0;
+      tdata_reg   <= '0;
+      tlast_reg   <= 1'b0;
+      tkeep_reg   <= '0;
+    end else begin
+      state <= next_state;
+
+      if (next_state == IDLE)
+        byte_count <= '0;
+      else if (in_data_valid && (state == IDLE || state == COLLECT_BYTES))
+        byte_count <= byte_count + 1;
+
+      if (in_data_valid)
+        data_buffer <= {data_buffer[23:0], in_data};
+
+      if (state == COLLECT_BYTES && byte_count == 2'd3 && in_data_valid) begin
+        tdata_reg <= {data_buffer[23:0], in_data};
+        tlast_reg <= 1'b1;
+        tkeep_reg <= 4'b1111;
+      end else if (tvalid && tready)
+        tlast_reg <= 1'b0;
+    end
+  end
+
+endmodule
+
+
+module axis_slave(
+  input  logic        clk,
+  input  logic        rst,
+  input  logic        tvalid,
+  input  logic [31:0] tdata,
+  input  logic        tlast,
+  input  logic [3:0]  tkeep,
+  output logic        tready
+);
+
+  logic [31:0] received_data_reg;
+  logic [1:0]  busy_counter;
+  logic        tready_reg;
+
+  assign tready = tready_reg;
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      received_data_reg <= '0;
+      tready_reg        <= 1'b1;
+      busy_counter      <= '0;
+    end else begin
+      tready_reg <= (busy_counter == 0);
+
+      if (busy_counter != 0)
+        busy_counter <= busy_counter - 1;
+
+      if (tvalid && tready_reg) begin
+        received_data_reg <= tdata;
+        tready_reg        <= 1'b0;
+        busy_counter      <= 2;
+      end
+    end
+  end
+
+endmodule
