@@ -1,0 +1,114 @@
+`timescale 1ns / 1ps
+
+module tb_axis_stream_fifo_system;
+
+  localparam CLK_PERIOD = 10ns;
+
+  logic clk, rstn;
+  logic [7:0] in_data;
+  logic       in_data_valid;
+
+  logic        tvalid_m2f;
+  logic [31:0] tdata_m2f;
+  logic        tlast_m2f;
+  logic [3:0]  tkeep_m2f;
+  logic        tready_m2f;
+
+  logic        tvalid_f2s;
+  logic [31:0] tdata_f2s;
+  logic        tlast_f2s;
+  logic [3:0]  tkeep_f2s;
+  logic        tready_f2s;
+
+  initial clk = 0;
+  always #(CLK_PERIOD/2) clk = ~clk;
+
+  axis_master u_master (
+    .clk          (clk),
+    .rst          (!rstn),
+    .in_data      (in_data),
+    .in_data_valid(in_data_valid),
+    .tready       (tready_m2f),
+    .tvalid       (tvalid_m2f),
+    .tdata        (tdata_m2f),
+    .tlast        (tlast_m2f),
+    .tkeep        (tkeep_m2f)
+  );
+
+  axis_fifo_bridge #(
+    .DWIDTH (32),
+    .DEPTH  (4)
+  ) u_bridge (
+    .clk           (clk),
+    .rstn          (rstn),
+    .s_axis_tdata  (tdata_m2f),
+    .s_axis_tvalid (tvalid_m2f),
+    .s_axis_tlast  (tlast_m2f),
+    .s_axis_tkeep  (tkeep_m2f),
+    .s_axis_tready (tready_m2f),
+    .m_axis_tdata  (tdata_f2s),
+    .m_axis_tvalid (tvalid_f2s),
+    .m_axis_tlast  (tlast_f2s),
+    .m_axis_tkeep  (tkeep_f2s),
+    .m_axis_tready (tready_f2s)
+  );
+
+  axis_slave u_slave (
+    .clk     (clk),
+    .rst     (!rstn),
+    .tvalid  (tvalid_f2s),
+    .tdata   (tdata_f2s),
+    .tlast   (tlast_f2s),
+    .tkeep   (tkeep_f2s),
+    .tready  (tready_f2s)
+  );
+
+  initial begin
+    $dumpfile("axis_fifo_system.vcd");
+    $dumpvars(0, tb_axis_stream_fifo_system);
+  end
+
+  initial begin
+    rstn = 0;
+    in_data = 0;
+    in_data_valid = 0;
+    repeat (5) @(posedge clk);
+    rstn = 1;
+    $display("[%0t] Reset released", $time);
+
+    $display("\n=== SCENARIO 1: Idle (TVALID=0, TREADY=0) ===");
+    repeat (5) @(posedge clk);
+
+    $display("\n=== SCENARIO 2: Idle/Wait (Slave ready, Master idle) ===");
+    repeat (5) @(posedge clk);
+
+    $display("\n=== SCENARIO 3: Master sends data, Slave stalls (TVALID=1, TREADY=0) ===");
+    force u_slave.tready_reg = 0;
+    send_bytes(8'hAA, 8'hBB, 8'hCC, 8'hDD);
+    repeat (10) @(posedge clk);
+    release u_slave.tready_reg;
+    $display("[%0t] Slave ready again — FIFO should flush buffered data.", $time);
+    repeat (10) @(posedge clk);
+
+    $display("\n=== SCENARIO 4: Normal data transfer (TVALID=1, TREADY=1) ===");
+    send_bytes(8'h11, 8'h22, 8'h33, 8'h44);
+    send_bytes(8'h55, 8'h66, 8'h77, 8'h88);
+    repeat (10) @(posedge clk);
+
+    $display("\n=== TEST COMPLETE ===");
+    $finish;
+  end
+
+  task send_bytes(input logic [7:0] b0, b1, b2, b3);
+    begin
+      in_data_valid = 1;
+      in_data = b0; @(posedge clk);
+      in_data = b1; @(posedge clk);
+      in_data = b2; @(posedge clk);
+      in_data = b3; @(posedge clk);
+      in_data_valid = 0;
+      repeat (5) @(posedge clk);
+    end
+  endtask
+
+endmodule
